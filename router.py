@@ -107,7 +107,7 @@ def listen_for_updates():
                 print(f"[{MY_IP}] Ignoring packet with unknown version from {addr}", flush=True)
                 continue
 
-            neighbor_ip = packet["router_id"]
+            neighbor_ip = addr[0]
             routes = packet["routes"]
             update_logic(neighbor_ip, routes)
         except json.JSONDecodeError:
