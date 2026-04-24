@@ -9,8 +9,8 @@ MY_IP = os.getenv("MY_IP", "127.0.0.1")
 NEIGHBORS = [n.strip() for n in os.getenv("NEIGHBORS", "").split(",") if n.strip()]
 PORT = 5000
 
-BROADCAST_INTERVAL = 5
-ROUTE_TIMEOUT = 15
+BROADCAST_INTERVAL = 2
+ROUTE_TIMEOUT = 45
 METRIC_INFINITY = 16
 
 routing_table_lock = threading.Lock()
