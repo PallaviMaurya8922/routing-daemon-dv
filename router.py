@@ -9,15 +9,20 @@ MY_IP = os.getenv("MY_IP", "127.0.0.1")
 NEIGHBORS = [n.strip() for n in os.getenv("NEIGHBORS", "").split(",") if n.strip()]
 PORT = 5000
 
-# Frequent updates help the 20s initial / 30s failure windows in evaluate_routers_*.py
 BROADCAST_INTERVAL = 2
-ROUTE_TIMEOUT = 30
+ROUTE_TIMEOUT = 45
 METRIC_INFINITY = 16
 
 routing_table_lock = threading.Lock()
 
 # routing_table: { subnet: [distance, next_hop, last_updated] }
 routing_table = {}
+
+
+def _normalize_ip(ip):
+    if isinstance(ip, str) and ip.startswith("::ffff:"):
+        return ip[7:]
+    return ip
 
 
 def get_local_subnets():
@@ -61,13 +66,51 @@ def init_routing_table():
     print(f"[{MY_IP}] Initialized with local subnets: {local_subnets}", flush=True)
 
 
+def resync_local_subnets():
+    """
+    Re-read interfaces vs routing_table.
+
+    Docker `network disconnect` removes the interface but our table can still
+    mark that prefix as distance 0, which makes update_logic ignore all DV
+    updates for it — so routes like 10.0.2.0/24 never come back and far
+    subnets (e.g. 10.0.6.0/24) fail to propagate through that node.
+
+    When an interface returns, replace a learned route with a fresh local entry
+    and drop our kernel `via` so the connected route can own the prefix.
+    """
+    locals_now = set(get_local_subnets())
+    changed = False
+    with routing_table_lock:
+        for subnet, (distance, _nh, _) in list(routing_table.items()):
+            if distance == 0 and subnet not in locals_now:
+                del routing_table[subnet]
+                changed = True
+                print(f"[{MY_IP}] Dropped stale local entry (interface gone): {subnet}", flush=True)
+
+        for subnet in locals_now:
+            if subnet not in routing_table:
+                routing_table[subnet] = [0, "0.0.0.0", time.time()]
+                changed = True
+            else:
+                d, nh, _ = routing_table[subnet]
+                if d != 0:
+                    remove_route(subnet)
+                    routing_table[subnet] = [0, "0.0.0.0", time.time()]
+                    changed = True
+                else:
+                    routing_table[subnet][2] = time.time()
+    return changed
+
+
 def build_update_packet(destination_ip):
     """Build a DV-JSON packet, applying Split Horizon with Poisoned Reverse."""
+    destination_ip = _normalize_ip(destination_ip)
     routes = []
     with routing_table_lock:
         for subnet, (distance, next_hop, _) in routing_table.items():
+            nh = _normalize_ip(next_hop)
             dist_out = int(distance) if distance != METRIC_INFINITY else METRIC_INFINITY
-            if next_hop == destination_ip and distance > 0:
+            if nh == destination_ip and distance > 0:
                 routes.append({"subnet": subnet, "distance": METRIC_INFINITY})
             else:
                 routes.append({"subnet": subnet, "distance": dist_out})
@@ -95,8 +138,10 @@ def send_updates_to_neighbors():
 
 
 def broadcast_updates():
-    """Send updates, expire stale routes, then wait (first send is immediate from main)."""
+    """Resync interfaces, send updates, expire stale routes, then sleep."""
     while True:
+        if resync_local_subnets():
+            print_routing_table()
         send_updates_to_neighbors()
         expire_stale_routes()
         time.sleep(BROADCAST_INTERVAL)
@@ -117,7 +162,7 @@ def listen_for_updates():
                 print(f"[{MY_IP}] Ignoring packet with unknown version from {addr}", flush=True)
                 continue
 
-            neighbor_ip = addr[0]
+            neighbor_ip = _normalize_ip(addr[0])
             routes = packet["routes"]
             changed = update_logic(neighbor_ip, routes)
             if changed:
@@ -138,6 +183,7 @@ def _advertised_metric(route):
 
 def update_logic(neighbor_ip, routes_from_neighbor):
     """Implement Bellman-Ford: compare received distances + 1 vs current distances."""
+    neighbor_ip = _normalize_ip(neighbor_ip)
     changed = False
     with routing_table_lock:
         for route in routes_from_neighbor:
@@ -152,6 +198,7 @@ def update_logic(neighbor_ip, routes_from_neighbor):
                     changed = True
             else:
                 current_distance, current_next_hop, _ = routing_table[subnet]
+                current_next_hop = _normalize_ip(current_next_hop)
 
                 if current_distance == 0:
                     continue
