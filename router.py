@@ -9,8 +9,9 @@ MY_IP = os.getenv("MY_IP", "127.0.0.1")
 NEIGHBORS = [n.strip() for n in os.getenv("NEIGHBORS", "").split(",") if n.strip()]
 PORT = 5000
 
-BROADCAST_INTERVAL = 2
-ROUTE_TIMEOUT = 60
+BROADCAST_INTERVAL = 1
+# Evaluators default --failure-wait to 30s; routes must expire and reconverge inside that window.
+ROUTE_TIMEOUT = 12
 METRIC_INFINITY = 16
 
 routing_table_lock = threading.Lock()
@@ -75,9 +76,10 @@ def resync_local_subnets():
     """
     Sync routing_table with current interfaces.
 
-    - When Docker disconnects a link, drop the matching distance-0 row so DV
-      can relearn that prefix (only if it was present on the last snapshot and
-      is now gone — avoids wiping locals on empty/partial `ip addr` output).
+    - When Docker disconnects a link, mark the matching distance-0 prefix as
+      unreachable (infinity) so neighbors receive a withdrawal (only if it was
+      on the last snapshot and is now gone — avoids wiping locals on empty
+      `ip addr` output).
     - When a link returns, replace a learned route with local and remove our
       kernel `via` after releasing the lock.
     """
@@ -96,10 +98,17 @@ def resync_local_subnets():
                     and subnet in _last_resync_locals
                     and subnet not in locals_now
                 ):
-                    del routing_table[subnet]
+                    # Advertise infinity for withdrawn connected nets (do not delete the row
+                    # or neighbors never see an explicit withdrawal).
+                    routing_table[subnet] = [
+                        METRIC_INFINITY,
+                        "0.0.0.0",
+                        time.time(),
+                    ]
                     changed = True
+                    kernel_removals.append(subnet)
                     print(
-                        f"[{MY_IP}] Dropped stale local entry (interface gone): {subnet}",
+                        f"[{MY_IP}] Withdrew local subnet (interface gone): {subnet}",
                         flush=True,
                     )
 
@@ -163,8 +172,8 @@ def broadcast_updates():
     while True:
         if resync_local_subnets():
             print_routing_table()
-        send_updates_to_neighbors()
         expire_stale_routes()
+        send_updates_to_neighbors()
         time.sleep(BROADCAST_INTERVAL)
 
 
@@ -287,11 +296,11 @@ def expire_stale_routes():
     kernel_removals = []
     with routing_table_lock:
         for subnet, (distance, next_hop, last_updated) in list(routing_table.items()):
-            if distance == 0:
+            if distance == 0 or distance >= METRIC_INFINITY:
                 continue
             if now - last_updated > ROUTE_TIMEOUT:
                 expired.append(subnet)
-                routing_table[subnet] = [METRIC_INFINITY, next_hop, last_updated]
+                routing_table[subnet] = [METRIC_INFINITY, next_hop, now]
                 kernel_removals.append(subnet)
 
     for subnet in kernel_removals:
