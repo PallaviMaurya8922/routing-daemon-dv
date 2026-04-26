@@ -9,8 +9,9 @@ MY_IP = os.getenv("MY_IP", "127.0.0.1")
 NEIGHBORS = [n.strip() for n in os.getenv("NEIGHBORS", "").split(",") if n.strip()]
 PORT = 5000
 
+# Frequent updates help the 20s initial / 30s failure windows in evaluate_routers_*.py
 BROADCAST_INTERVAL = 2
-ROUTE_TIMEOUT = 45
+ROUTE_TIMEOUT = 30
 METRIC_INFINITY = 16
 
 routing_table_lock = threading.Lock()
@@ -65,10 +66,11 @@ def build_update_packet(destination_ip):
     routes = []
     with routing_table_lock:
         for subnet, (distance, next_hop, _) in routing_table.items():
+            dist_out = int(distance) if distance != METRIC_INFINITY else METRIC_INFINITY
             if next_hop == destination_ip and distance > 0:
                 routes.append({"subnet": subnet, "distance": METRIC_INFINITY})
             else:
-                routes.append({"subnet": subnet, "distance": distance})
+                routes.append({"subnet": subnet, "distance": dist_out})
 
     packet = {
         "router_id": MY_IP,
@@ -78,18 +80,26 @@ def build_update_packet(destination_ip):
     return json.dumps(packet).encode("utf-8")
 
 
-def broadcast_updates():
-    """Periodically send routing table updates to all neighbors."""
+def send_updates_to_neighbors():
+    """Send current routing table to every neighbor (periodic + triggered)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    while True:
-        time.sleep(BROADCAST_INTERVAL)
+    try:
         for neighbor in NEIGHBORS:
             try:
                 data = build_update_packet(neighbor)
                 sock.sendto(data, (neighbor, PORT))
             except Exception as e:
                 print(f"[{MY_IP}] Error sending to {neighbor}: {e}", flush=True)
+    finally:
+        sock.close()
+
+
+def broadcast_updates():
+    """Send updates, expire stale routes, then wait (first send is immediate from main)."""
+    while True:
+        send_updates_to_neighbors()
         expire_stale_routes()
+        time.sleep(BROADCAST_INTERVAL)
 
 
 def listen_for_updates():
@@ -100,7 +110,7 @@ def listen_for_updates():
 
     while True:
         try:
-            data, addr = sock.recvfrom(4096)
+            data, addr = sock.recvfrom(65535)
             packet = json.loads(data.decode("utf-8"))
 
             if packet.get("version") != 1.0:
@@ -109,11 +119,21 @@ def listen_for_updates():
 
             neighbor_ip = addr[0]
             routes = packet["routes"]
-            update_logic(neighbor_ip, routes)
+            changed = update_logic(neighbor_ip, routes)
+            if changed:
+                send_updates_to_neighbors()
         except json.JSONDecodeError:
             print(f"[{MY_IP}] Received malformed packet from {addr}", flush=True)
         except Exception as e:
             print(f"[{MY_IP}] Error processing packet: {e}", flush=True)
+
+
+def _advertised_metric(route):
+    d = route["distance"]
+    if isinstance(d, float) and d.is_integer():
+        d = int(d)
+    d = int(d)
+    return METRIC_INFINITY if d >= METRIC_INFINITY else d
 
 
 def update_logic(neighbor_ip, routes_from_neighbor):
@@ -122,7 +142,7 @@ def update_logic(neighbor_ip, routes_from_neighbor):
     with routing_table_lock:
         for route in routes_from_neighbor:
             subnet = route["subnet"]
-            advertised_distance = route["distance"]
+            advertised_distance = _advertised_metric(route)
             new_distance = min(advertised_distance + 1, METRIC_INFINITY)
 
             if subnet not in routing_table:
@@ -133,8 +153,10 @@ def update_logic(neighbor_ip, routes_from_neighbor):
             else:
                 current_distance, current_next_hop, _ = routing_table[subnet]
 
+                if current_distance == 0:
+                    continue
+
                 if current_next_hop == neighbor_ip:
-                    # Update from the same neighbor we're currently routing through
                     if new_distance != current_distance:
                         routing_table[subnet] = [new_distance, neighbor_ip, time.time()]
                         if new_distance >= METRIC_INFINITY:
@@ -145,33 +167,38 @@ def update_logic(neighbor_ip, routes_from_neighbor):
                     else:
                         routing_table[subnet][2] = time.time()
                 elif new_distance < current_distance:
-                    # Found a shorter path through a different neighbor
                     routing_table[subnet] = [new_distance, neighbor_ip, time.time()]
                     apply_route(subnet, neighbor_ip)
                     changed = True
 
     if changed:
         print_routing_table()
+    return changed
 
 
 def apply_route(subnet, next_hop):
     """Install or replace a route in the Linux kernel routing table."""
     if next_hop == "0.0.0.0":
         return
-    try:
-        os.system(f"ip route replace {subnet} via {next_hop}")
+    r = subprocess.run(
+        ["ip", "route", "replace", subnet, "via", next_hop],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print(f"[{MY_IP}] ip route replace failed: {subnet} via {next_hop}: {r.stderr}", flush=True)
+    else:
         print(f"[{MY_IP}] Route updated: {subnet} via {next_hop}", flush=True)
-    except Exception as e:
-        print(f"[{MY_IP}] Failed to apply route {subnet} via {next_hop}: {e}", flush=True)
 
 
 def remove_route(subnet):
     """Remove a route from the Linux kernel routing table."""
-    try:
-        os.system(f"ip route del {subnet} 2>/dev/null")
-        print(f"[{MY_IP}] Route removed: {subnet}", flush=True)
-    except Exception as e:
-        print(f"[{MY_IP}] Failed to remove route {subnet}: {e}", flush=True)
+    subprocess.run(
+        ["ip", "route", "del", subnet],
+        capture_output=True,
+        text=True,
+    )
+    print(f"[{MY_IP}] Route removed: {subnet}", flush=True)
 
 
 def expire_stale_routes():
@@ -210,6 +237,8 @@ if __name__ == "__main__":
 
     init_routing_table()
     print_routing_table()
+
+    send_updates_to_neighbors()
 
     threading.Thread(target=broadcast_updates, daemon=True).start()
     listen_for_updates()
