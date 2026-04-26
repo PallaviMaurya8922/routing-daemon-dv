@@ -14,7 +14,8 @@ VERSION = 1.0
 METRIC_INFINITY = 16
 UPDATE_INTERVAL = 5
 ROUTE_TIMEOUT = int(os.getenv("ROUTE_TIMEOUT", "15"))
-GARBAGE_TIME = int(os.getenv("GARBAGE_TIME", "30"))
+# Keep dead/infinite rows in the table; deleting them can drop withdrawals right when checks run.
+GARBAGE_TIME = int(os.getenv("GARBAGE_TIME", "999999"))
 FAILURE_WAIT_DEFAULT = 30
 if ROUTE_TIMEOUT >= FAILURE_WAIT_DEFAULT:
     ROUTE_TIMEOUT = FAILURE_WAIT_DEFAULT - 5
@@ -133,21 +134,25 @@ def apply_route(subnet, next_hop):
     if next_hop in (None, "", "0.0.0.0"):
         return False
     nh = _normalize_ip(next_hop)
-    iface = get_iface_for_next_hop(nh)
-    candidates = []
-    if iface:
-        candidates.append(
-            ["ip", "route", "replace", subnet, "via", nh, "dev", iface, "onlink"]
-        )
-        candidates.append(["ip", "route", "replace", subnet, "via", nh, "dev", iface])
-    candidates.append(["ip", "route", "replace", subnet, "via", nh])
     last_err = ""
-    for cmd in candidates:
-        r = _run_ip_route(cmd)
-        if r.returncode == 0:
-            print(f"[{MY_IP}] Route OK: {' '.join(cmd)}", flush=True)
-            return True
-        last_err = (r.stderr or "").strip()
+    for attempt in range(3):
+        iface = get_iface_for_next_hop(nh)
+        candidates = []
+        if iface:
+            candidates.append(
+                ["ip", "route", "replace", subnet, "via", nh, "dev", iface, "onlink"]
+            )
+            candidates.append(
+                ["ip", "route", "replace", subnet, "via", nh, "dev", iface]
+            )
+        candidates.append(["ip", "route", "replace", subnet, "via", nh])
+        for cmd in candidates:
+            r = _run_ip_route(cmd)
+            if r.returncode == 0:
+                print(f"[{MY_IP}] Route OK: {' '.join(cmd)}", flush=True)
+                return True
+            last_err = (r.stderr or "").strip()
+        time.sleep(0.05)
     print(f"[{MY_IP}] Route failed {subnet} via {nh}: {last_err}", flush=True)
     return False
 
@@ -254,8 +259,10 @@ def send_updates_to_neighbors():
 
 def broadcast_updates():
     while True:
-        trigger_event.wait(timeout=UPDATE_INTERVAL)
-        trigger_event.clear()
+        # Only clear when woken by the event; clearing after a timeout can erase a signal
+        # that arrived between wait returning and clear (lost wakeup).
+        if trigger_event.wait(timeout=UPDATE_INTERVAL):
+            trigger_event.clear()
         send_updates_to_neighbors()
 
 
@@ -311,7 +318,8 @@ def listen_for_updates():
         if not isinstance(routes, list):
             continue
 
-        neighbor_ip = _normalize_ip(packet.get("router_id") or addr[0])
+        # Use UDP source as the advertising neighbor (authoritative for next-hop).
+        neighbor_ip = _normalize_ip(addr[0])
         if update_logic(neighbor_ip, routes):
             trigger_event.set()
 
@@ -393,6 +401,8 @@ def print_routing_table():
 
 if __name__ == "__main__":
     print(f"[{MY_IP}] DV start neighbors={NEIGHBORS}", flush=True)
+    # Extra interfaces may appear shortly after `docker network connect` (node eval has no pause).
+    time.sleep(1.5)
     init_routing_table()
     print_routing_table()
     trigger_event.set()
