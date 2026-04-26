@@ -10,13 +10,17 @@ NEIGHBORS = [n.strip() for n in os.getenv("NEIGHBORS", "").split(",") if n.strip
 PORT = 5000
 
 BROADCAST_INTERVAL = 2
-ROUTE_TIMEOUT = 45
+ROUTE_TIMEOUT = 60
 METRIC_INFINITY = 16
 
 routing_table_lock = threading.Lock()
 
 # routing_table: { subnet: [distance, next_hop, last_updated] }
 routing_table = {}
+
+# Previous interface-derived subnets (see resync_local_subnets) — avoids deleting
+# all "local" rows on an empty/partial ip addr snapshot during Docker churn.
+_last_resync_locals = None
 
 
 def _normalize_ip(ip):
@@ -31,7 +35,8 @@ def get_local_subnets():
     try:
         result = subprocess.run(
             ["ip", "-4", "-o", "addr", "show"],
-            capture_output=True, text=True
+            capture_output=True,
+            text=True,
         )
         for line in result.stdout.strip().split("\n"):
             parts = line.split()
@@ -68,37 +73,53 @@ def init_routing_table():
 
 def resync_local_subnets():
     """
-    Re-read interfaces vs routing_table.
+    Sync routing_table with current interfaces.
 
-    Docker `network disconnect` removes the interface but our table can still
-    mark that prefix as distance 0, which makes update_logic ignore all DV
-    updates for it — so routes like 10.0.2.0/24 never come back and far
-    subnets (e.g. 10.0.6.0/24) fail to propagate through that node.
-
-    When an interface returns, replace a learned route with a fresh local entry
-    and drop our kernel `via` so the connected route can own the prefix.
+    - When Docker disconnects a link, drop the matching distance-0 row so DV
+      can relearn that prefix (only if it was present on the last snapshot and
+      is now gone — avoids wiping locals on empty/partial `ip addr` output).
+    - When a link returns, replace a learned route with local and remove our
+      kernel `via` after releasing the lock.
     """
+    global _last_resync_locals
     locals_now = set(get_local_subnets())
+    if not locals_now:
+        return False
+
     changed = False
+    kernel_removals = []
     with routing_table_lock:
-        for subnet, (distance, _nh, _) in list(routing_table.items()):
-            if distance == 0 and subnet not in locals_now:
-                del routing_table[subnet]
-                changed = True
-                print(f"[{MY_IP}] Dropped stale local entry (interface gone): {subnet}", flush=True)
+        if _last_resync_locals is not None:
+            for subnet, (distance, _nh, _) in list(routing_table.items()):
+                if (
+                    distance == 0
+                    and subnet in _last_resync_locals
+                    and subnet not in locals_now
+                ):
+                    del routing_table[subnet]
+                    changed = True
+                    print(
+                        f"[{MY_IP}] Dropped stale local entry (interface gone): {subnet}",
+                        flush=True,
+                    )
 
         for subnet in locals_now:
             if subnet not in routing_table:
                 routing_table[subnet] = [0, "0.0.0.0", time.time()]
                 changed = True
             else:
-                d, nh, _ = routing_table[subnet]
+                d, _nh, _ = routing_table[subnet]
                 if d != 0:
-                    remove_route(subnet)
                     routing_table[subnet] = [0, "0.0.0.0", time.time()]
+                    kernel_removals.append(subnet)
                     changed = True
                 else:
                     routing_table[subnet][2] = time.time()
+
+        _last_resync_locals = set(locals_now)
+
+    for subnet in kernel_removals:
+        remove_route(subnet)
     return changed
 
 
@@ -182,9 +203,15 @@ def _advertised_metric(route):
 
 
 def update_logic(neighbor_ip, routes_from_neighbor):
-    """Implement Bellman-Ford: compare received distances + 1 vs current distances."""
+    """
+    Bellman-Ford updates in memory under a short lock; kernel routes applied
+    after releasing the lock so the broadcast thread is not starved.
+    """
     neighbor_ip = _normalize_ip(neighbor_ip)
     changed = False
+    kernel_applies = []
+    kernel_removals = []
+
     with routing_table_lock:
         for route in routes_from_neighbor:
             subnet = route["subnet"]
@@ -194,7 +221,7 @@ def update_logic(neighbor_ip, routes_from_neighbor):
             if subnet not in routing_table:
                 if new_distance < METRIC_INFINITY:
                     routing_table[subnet] = [new_distance, neighbor_ip, time.time()]
-                    apply_route(subnet, neighbor_ip)
+                    kernel_applies.append((subnet, neighbor_ip))
                     changed = True
             else:
                 current_distance, current_next_hop, _ = routing_table[subnet]
@@ -207,16 +234,21 @@ def update_logic(neighbor_ip, routes_from_neighbor):
                     if new_distance != current_distance:
                         routing_table[subnet] = [new_distance, neighbor_ip, time.time()]
                         if new_distance >= METRIC_INFINITY:
-                            remove_route(subnet)
+                            kernel_removals.append(subnet)
                         else:
-                            apply_route(subnet, neighbor_ip)
+                            kernel_applies.append((subnet, neighbor_ip))
                         changed = True
                     else:
                         routing_table[subnet][2] = time.time()
                 elif new_distance < current_distance:
                     routing_table[subnet] = [new_distance, neighbor_ip, time.time()]
-                    apply_route(subnet, neighbor_ip)
+                    kernel_applies.append((subnet, neighbor_ip))
                     changed = True
+
+    for subnet in kernel_removals:
+        remove_route(subnet)
+    for subnet, nh in kernel_applies:
+        apply_route(subnet, nh)
 
     if changed:
         print_routing_table()
@@ -252,6 +284,7 @@ def expire_stale_routes():
     """Remove routes that haven't been refreshed within the timeout window."""
     now = time.time()
     expired = []
+    kernel_removals = []
     with routing_table_lock:
         for subnet, (distance, next_hop, last_updated) in list(routing_table.items()):
             if distance == 0:
@@ -259,7 +292,10 @@ def expire_stale_routes():
             if now - last_updated > ROUTE_TIMEOUT:
                 expired.append(subnet)
                 routing_table[subnet] = [METRIC_INFINITY, next_hop, last_updated]
-                remove_route(subnet)
+                kernel_removals.append(subnet)
+
+    for subnet in kernel_removals:
+        remove_route(subnet)
 
     if expired:
         print(f"[{MY_IP}] Expired routes: {expired}", flush=True)
